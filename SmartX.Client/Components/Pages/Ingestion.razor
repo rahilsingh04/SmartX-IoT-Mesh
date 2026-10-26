@@ -1,0 +1,289 @@
+@page "/ingestion"
+@inject SmartXApiClient Api
+@inject SimulatorService Sim
+@implements IDisposable
+
+<PageTitle>Sensor Ingestion &amp; Telemetry</PageTitle>
+
+<h1>Sensor Data Ingestion &amp; Telemetry</h1>
+<p class="lead">Register sensors against the facility deployment tree, ingest telemetry, attach device
+logs, and watch mesh health on the live pulse grid below.</p>
+
+<section class="panel">
+    <h2>Register a Sensor</h2>
+    <div class="valid-paths">
+        <strong>Configured deployment paths:</strong>
+        @if (validPaths.Count == 0)
+        {
+            <span>loading&hellip;</span>
+        }
+        else
+        {
+            @foreach (var p in validPaths)
+            {
+                <code class="path-chip" @onclick="() => newSensor.DeploymentPath = p">@p</code>
+            }
+        }
+    </div>
+
+    <EditForm Model="newSensor" OnValidSubmit="RegisterSensorAsync">
+        <div class="form-grid">
+            <label>MAC Address / Unique ID
+                <InputText @bind-Value="newSensor.MacAddress" placeholder="AA:BB:CC:00:00:07" />
+            </label>
+            <label>Device Name (optional)
+                <InputText @bind-Value="newSensor.Name" placeholder="e.g. Pump B" />
+            </label>
+            <label>Location Label
+                <InputText @bind-Value="newSensor.Location" placeholder="e.g. Node-07" />
+            </label>
+            <label>Category
+                <InputSelect @bind-Value="newSensor.Category">
+                    <option value="Environmental">Environmental</option>
+                    <option value="PowerConsumption">Power Consumption</option>
+                    <option value="Actuator">Actuator</option>
+                </InputSelect>
+            </label>
+            <label>Deployment Path (Facility/Zone/Sub-Zone)
+                <InputText @bind-Value="newSensor.DeploymentPath" placeholder="Facility A/Zone 1/Sub-Zone B" />
+            </label>
+        </div>
+        <button type="submit" class="btn-primary">Register Sensor</button>
+    </EditForm>
+
+    @if (!string.IsNullOrEmpty(registerMessage))
+    {
+        <p class="@(registerOk ? "msg-ok" : "msg-error")">@registerMessage</p>
+    }
+</section>
+
+<section class="panel">
+    <div class="panel-header-row">
+        <h2>Live Telemetry Pulse Grid</h2>
+        <button class="btn-secondary" @onclick="Sim.Toggle">
+            @(Sim.IsRunning ? "⏸ Stop Simulation" : "▶ Start Live Simulation")
+        </button>
+    </div>
+    <p class="hint">Each tile pulses as new telemetry arrives. Colour = health state, the number is an
+    uptime streak that resets whenever a sustained anomaly or a silence is detected &mdash; this is the
+    gamified engagement widget described in the Task 1 research report.</p>
+
+    <div class="pulse-grid">
+        @foreach (var sensor in sensors)
+        {
+            var state = pulseStates.TryGetValue(sensor.MacAddress, out var s) ? s : null;
+            var health = state?.Health ?? "unknown";
+            <div class="pulse-tile @health @(state?.JustPulsed == true ? "pulsing" : "")">
+                <div class="pulse-tile-title">@sensor.DisplayName</div>
+                <div class="pulse-tile-sub">@sensor.Category</div>
+                <div class="pulse-tile-status">
+                    @if (health == "ok")
+                    {
+                        <span>OK &middot; streak x@(state?.Streak ?? 0)</span>
+                    }
+                    else if (health == "spike")
+                    {
+                        <span>SPIKE &middot; streak reset</span>
+                    }
+                    else if (health == "silent")
+                    {
+                        <span>SILENT</span>
+                    }
+                    else
+                    {
+                        <span>awaiting data&hellip;</span>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+</section>
+
+<section class="panel">
+    <h2>Registered Sensors &amp; Attachments</h2>
+    <table class="data-table">
+        <thead>
+            <tr><th>Name</th><th>Location</th><th>MAC</th><th>Category</th><th>Deployment Path</th><th>Attach File</th><th>Files</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var sensor in sensors)
+            {
+                <tr>
+                    <td>@sensor.DisplayName</td>
+                    <td>@sensor.Location</td>
+                    <td>@sensor.MacAddress</td>
+                    <td>@sensor.Category</td>
+                    <td><code>@sensor.DeploymentPath</code></td>
+                    <td>
+                        <InputFile OnChange="@(e => OnFileSelected(e, sensor.Id))" />
+                    </td>
+                    <td>
+                        @foreach (var f in sensor.Attachments)
+                        {
+                            <div><a class="file-link" href="@Api.AttachmentDownloadUrl(sensor.Id, f.Id)" target="_blank">&#128206; @f.FileName</a> <span class="muted-small">(@(f.SizeBytes / 1024 + 1) KB, encrypted at rest)</span></div>
+                        }
+                        @if (sensor.Attachments.Count == 0) { <span class="muted-small">none</span> }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</section>
+
+<section class="panel">
+    <h2>Recent Telemetry Log</h2>
+    <table class="data-table small">
+        <thead><tr><th>Device</th><th>Value</th><th>Captured</th></tr></thead>
+        <tbody>
+            @foreach (var r in recentReadings.AsEnumerable().Reverse().Take(15))
+            {
+                <tr><td>@r.DeviceId</td><td>@r.Value.ToString("F2")</td><td>@r.CapturedAt.ToLocalTime().ToString("HH:mm:ss")</td></tr>
+            }
+        </tbody>
+    </table>
+</section>
+
+@code {
+    private List<SensorProfileDto> sensors = new();
+    private List<SensorReadingDto> recentReadings = new();
+    private List<string> validPaths = new();
+    private Dictionary<string, PulseState> pulseStates = new();
+
+    private SensorRegistrationForm newSensor = new();
+    private string registerMessage = "";
+    private bool registerOk;
+
+    private System.Threading.Timer? refreshTimer;
+
+    private void OnSimChanged() => _ = InvokeAsync(() => { try { StateHasChanged(); } catch (ObjectDisposedException) { } });
+
+    protected override async Task OnInitializedAsync()
+    {
+        Sim.Changed += OnSimChanged;
+        await RefreshAsync();
+        var tree = await Api.GetFacilityTreeAsync();
+        if (tree is not null)
+        {
+            validPaths = FlattenPaths(tree, "").ToList();
+        }
+
+        refreshTimer = new System.Threading.Timer(_ => { _ = SafeRefreshAsync(); }, null,
+            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    // Recursively walks the facility tree to list every valid leaf-to-root path,
+    // mirroring the server-side RecursiveDeploymentValidator traversal.
+    private IEnumerable<string> FlattenPaths(DeploymentNodeDto node, string prefix)
+    {
+        var path = string.IsNullOrEmpty(prefix) ? node.Name : $"{prefix}/{node.Name}";
+        if (node.Children.Count == 0)
+        {
+            yield return path;
+        }
+        else
+        {
+            foreach (var child in node.Children)
+                foreach (var p in FlattenPaths(child, path))
+                    yield return p;
+        }
+    }
+
+    private async Task SafeRefreshAsync()
+    {
+        try { await InvokeAsync(RefreshAsync); } catch { /* circuit closed or API briefly unavailable */ }
+    }
+
+    private async Task RefreshAsync()
+    {
+        sensors = await Api.GetSensorsAsync();
+        recentReadings = await Api.GetRecentReadingsAsync(200);
+        RecomputePulseStates();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void RecomputePulseStates()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var sensor in sensors)
+        {
+            var readings = recentReadings.Where(r => r.DeviceId == sensor.MacAddress)
+                                          .OrderBy(r => r.CapturedAt).ToList();
+            if (readings.Count == 0)
+            {
+                pulseStates[sensor.MacAddress] = new PulseState { Health = "unknown" };
+                continue;
+            }
+
+            var last = readings[^1];
+            var prev = pulseStates.TryGetValue(sensor.MacAddress, out var existing) ? existing : new PulseState();
+            var justPulsed = existing is null || last.CapturedAt > existing.LastSeen;
+
+            var window = readings.TakeLast(10).Select(r => r.Value).ToList();
+            var mean = window.Average();
+            var stdDev = Math.Sqrt(window.Select(v => Math.Pow(v - mean, 2)).Average());
+            var isSilent = (now - last.CapturedAt) > TimeSpan.FromSeconds(30);
+            var isSpike = !isSilent && stdDev > 0.0001 && Math.Abs(last.Value - mean) > 2.0 * stdDev && window.Count >= 4;
+
+            string health = isSilent ? "silent" : isSpike ? "spike" : "ok";
+            int streak = health == "ok" ? prev.Streak + (justPulsed ? 1 : 0) : 0;
+
+            pulseStates[sensor.MacAddress] = new PulseState
+            {
+                LastValue = last.Value,
+                LastSeen = last.CapturedAt,
+                Streak = streak,
+                Health = health,
+                JustPulsed = justPulsed
+            };
+        }
+    }
+
+    private async Task RegisterSensorAsync()
+    {
+        var req = new SensorRegistrationRequest(newSensor.MacAddress, newSensor.Location, newSensor.Category, newSensor.DeploymentPath, string.IsNullOrWhiteSpace(newSensor.Name) ? null : newSensor.Name);
+        var (ok, message) = await Api.RegisterSensorAsync(req);
+        registerOk = ok;
+        registerMessage = string.IsNullOrEmpty(message)
+            ? (ok ? "Sensor registered." : "Registration failed.")
+            : message;
+        if (ok)
+        {
+            newSensor = new SensorRegistrationForm();
+            await RefreshAsync();
+        }
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e, string sensorId)
+    {
+        var file = e.File;
+        if (file is null) return;
+
+        await using var stream = file.OpenReadStream(maxAllowedSize: 25 * 1024 * 1024);
+        await Api.UploadAttachmentAsync(sensorId, stream, file.Name, file.ContentType);
+        await RefreshAsync();
+    }
+
+    public void Dispose()
+    {
+        refreshTimer?.Dispose();
+        Sim.Changed -= OnSimChanged;
+    }
+
+    private class PulseState
+    {
+        public double LastValue { get; set; }
+        public DateTimeOffset LastSeen { get; set; }
+        public int Streak { get; set; }
+        public string Health { get; set; } = "unknown";
+        public bool JustPulsed { get; set; }
+    }
+
+    private class SensorRegistrationForm
+    {
+        public string MacAddress { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string Location { get; set; } = "";
+        public SensorCategory Category { get; set; } = SensorCategory.Environmental;
+        public string DeploymentPath { get; set; } = "";
+    }
+}
