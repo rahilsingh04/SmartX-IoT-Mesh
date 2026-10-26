@@ -1,0 +1,429 @@
+@page "/command-stream"
+@inject SmartXApiClient Api
+@inject SimulatorService Sim
+@inject UiState Ui
+@implements IDisposable
+
+<PageTitle>Real-Time Command Stream &amp; History</PageTitle>
+
+<h1>Real-Time Command Stream &amp; History</h1>
+<p class="lead">Live devices are held in a <code>Dictionary</code> keyed by MAC. Packets flow through a FIFO
+<code>Queue</code>; critical alerts jump ahead through a <code>PriorityQueue</code>. Manual commands are kept on a
+<code>Stack</code> so they can be undone.</p>
+
+<section class="panel">
+    <div class="panel-header-row">
+        <h2>Stream Control &amp; Pipeline</h2>
+        <button class="btn-secondary" @onclick="Sim.Toggle">@(Sim.IsRunning ? "⏸ Stop device simulator" : "▶ Start device simulator")</button>
+    </div>
+    <div class="stat-row">
+        <div class="stat"><div class="n">@stats.FifoDepth</div><div class="l">FIFO queue depth</div></div>
+        <div class="stat @(stats.PriorityDepth > 0 ? "hot" : "")"><div class="n">@stats.PriorityDepth</div><div class="l">Priority queue depth</div></div>
+        <div class="stat"><div class="n">@stats.Received</div><div class="l">Packets received</div></div>
+        <div class="stat"><div class="n">@stats.Processed</div><div class="l">Packets processed</div></div>
+        <div class="stat @(stats.CriticalProcessed > 0 ? "hot" : "")"><div class="n">@stats.CriticalProcessed</div><div class="l">Critical (fast lane)</div></div>
+        <div class="stat"><div class="n">@stats.ActiveErrorCount</div><div class="l">Unique active errors</div></div>
+        <div class="stat"><div class="n">@stats.DisconnectedCount</div><div class="l">Disconnected nodes</div></div>
+        <div class="stat"><div class="n">@stats.DuplicatesSuppressed</div><div class="l">Duplicates suppressed</div></div>
+        <div class="stat"><div class="n">@stats.CommandStackDepth</div><div class="l">Undo stack depth</div></div>
+    </div>
+    @if (!string.IsNullOrEmpty(Sim.LastError))
+    {
+        <p class="msg-error">Simulator error: @Sim.LastError</p>
+    }
+    <p class="hint">Test tools &mdash; these POST to the API exactly like a device would:</p>
+    <div class="cmd-row">
+        <select @bind="testDevice">
+            @foreach (var d in allDevices.Where(x => !x.IsActuator))
+            {
+                <option value="@d.Mac">@d.Name</option>
+            }
+        </select>
+        <button class="btn-small" @onclick="FireCritical">⚠ Fire critical alert</button>
+        <button class="btn-small" @onclick="SendBurst">⚡ Burst: 150 normal + 1 critical last</button>
+        <button class="btn-small" @onclick="ReportDisconnect3">🔌 Report disconnect ×3 (HashSet dedupe)</button>
+        <button class="btn-small" @onclick="MuteTest">🔇 Mute / unmute device (watchdog)</button>
+    </div>
+    @if (!string.IsNullOrEmpty(toolMessage))
+    {
+        <p class="msg-ok">@toolMessage</p>
+    }
+</section>
+
+<div class="cols-3">
+    <section class="panel">
+        <h2>Live Devices <span class="muted-small">(@devices.Count shown)</span></h2>
+        <div class="filter-bar">
+            <input placeholder="Search name, MAC, location…" value="@Ui.SearchText" @oninput="OnSearchInput" />
+            <select value="@Ui.CategoryFilter" @onchange="OnCategoryChanged">
+                <option value="All">All categories</option>
+                <option value="Environmental">Environmental</option>
+                <option value="PowerConsumption">Power</option>
+                <option value="Actuator">Actuator</option>
+            </select>
+            <select value="@Ui.StateFilter" @onchange="OnStateChanged">
+                <option value="All">All states</option>
+                <option value="Alert">Any alert</option>
+                <option value="Normal">Normal</option>
+                <option value="Warning">Warning</option>
+                <option value="Critical">Critical</option>
+                <option value="Disconnected">Disconnected</option>
+            </select>
+        </div>
+        <div class="scroll-box" style="max-height:420px">
+            <table class="data-table">
+                <thead><tr><th>Device</th><th>Category</th><th>Value</th><th>State</th><th>Seen</th><th></th></tr></thead>
+                <tbody>
+                    @foreach (var d in devices)
+                    {
+                        <tr class="device-row @(d.Mac == Ui.SelectedMac ? "selected" : "")" @onclick="() => SelectDevice(d.Mac)">
+                            <td>@d.Name<br /><span class="mac">@d.Mac</span></td>
+                            <td>@d.Category</td>
+                            <td>
+                                @if (d.IsActuator) { <strong>@(d.IsOn ? "ON" : "OFF")</strong> }
+                                else { @($"{d.Value:F1} {d.Unit}") }
+                            </td>
+                            <td><span class="badge @d.Status" title="@d.Message">@d.Status</span></td>
+                            <td>@(d.SecondsSinceSeen)s</td>
+                            <td>
+                                @if (d.IsActuator)
+                                {
+                                    <button class="btn-small" @onclick="() => QuickToggle(d)" @onclick:stopPropagation="true">@(d.IsOn ? "Turn off" : "Turn on")</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                    @if (devices.Count == 0)
+                    {
+                        <tr><td colspan="6" class="muted-small">No devices match the current filters.</td></tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Suggested Actions</h2>
+        <p class="hint">Predicted from learned patterns (Markov chain over alerts, searches and commands).</p>
+        @foreach (var ins in insights.Insights)
+        {
+            <div class="insight @ins.Severity">
+                <div class="t">@ins.Title</div>
+                <div class="d">@ins.Detail</div>
+                @if (ins.Confidence > 0) { <div class="conf">confidence @((ins.Confidence * 100).ToString("F0"))%</div> }
+                @if (!string.IsNullOrEmpty(ins.Action) && !string.IsNullOrEmpty(ins.TargetMac))
+                {
+                    <button class="btn-small" @onclick="() => Quick(ins.TargetMac!, ins.Action!)">Apply: @ins.Action</button>
+                }
+                @if (!string.IsNullOrEmpty(ins.SearchText))
+                {
+                    <button class="btn-small" @onclick="() => ApplySearch(ins.SearchText!)">Search “@ins.SearchText”</button>
+                }
+            </div>
+        }
+        @if (insights.Insights.Count == 0)
+        {
+            <p class="muted-small">All quiet &mdash; no suggestions right now.</p>
+        }
+        <p class="muted-small">Recent events: @string.Join(" › ", insights.RecentEvents.Take(5))</p>
+    </section>
+</div>
+
+<div class="cols-2">
+    <section class="panel">
+        <h2>Manual Override Command</h2>
+        <div class="cmd-row">
+            <select @bind="Ui.CommandTarget">
+                <option value="ALL_ACTUATORS">ALL ACTUATORS</option>
+                @foreach (var d in allDevices.Where(x => x.IsActuator))
+                {
+                    <option value="@d.Mac">@d.Name</option>
+                }
+            </select>
+            <select @bind="Ui.CommandAction">
+                <option value="On">On</option>
+                <option value="Off">Off</option>
+                <option value="Toggle">Toggle</option>
+            </select>
+            <button class="btn-primary" @onclick="SendCommand">Send command</button>
+            <button class="btn-danger" @onclick="Undo" disabled="@(commands.Count == 0)">↶ Undo last</button>
+        </div>
+        @if (!string.IsNullOrEmpty(commandMessage))
+        {
+            <p class="@(commandOk ? "msg-ok" : "msg-error")">@commandMessage</p>
+        }
+        <h3>Command history (Stack, newest first)</h3>
+        <div class="scroll-box">
+            <table class="data-table small">
+                <thead><tr><th>#</th><th>Target</th><th>Action</th><th>Time</th></tr></thead>
+                <tbody>
+                    @foreach (var c in commands)
+                    {
+                        <tr><td>@c.Id</td><td>@c.TargetLabel</td><td>@c.Action</td><td>@c.IssuedAt.ToLocalTime().ToString("HH:mm:ss")</td></tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Alerts &amp; Error State</h2>
+        <p><strong>Unique active errors (HashSet):</strong>
+            @foreach (var e in alerts.ActiveErrors) { <span class="chip err">@e.DeviceName · @e.Level</span> }
+            @if (alerts.ActiveErrors.Count == 0) { <span class="muted-small">none</span> }
+        </p>
+        <p><strong>Disconnected nodes (HashSet):</strong>
+            @foreach (var e in alerts.Disconnected) { <span class="chip dc">@e.DeviceName</span> }
+            @if (alerts.Disconnected.Count == 0) { <span class="muted-small">none</span> }
+        </p>
+        <div class="scroll-box">
+            <table class="data-table small">
+                <thead><tr><th>Time</th><th>Device</th><th>Alert</th><th>Lane</th><th>Jumped queue</th></tr></thead>
+                <tbody>
+                    @foreach (var a in alerts.Log.Take(30))
+                    {
+                        <tr>
+                            <td>@a.RaisedAt.ToLocalTime().ToString("HH:mm:ss")</td>
+                            <td>@a.DeviceName</td>
+                            <td>@a.Message</td>
+                            <td class="lane-@a.Lane">@a.Lane</td>
+                            <td>@(a.BypassedQueueDepth > 0 ? $"ahead of {a.BypassedQueueDepth}" : "-")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+</div>
+
+<div class="cols-2">
+    <section class="panel">
+        <h2>Processing Order <span class="muted-small">(newest first)</span></h2>
+        <p class="hint">After a burst, scroll to the bottom of this list: the PRIORITY row has the highest Seq (it arrived last) yet was processed first.</p>
+        <div class="scroll-box">
+            <table class="data-table small">
+                <thead><tr><th>Seq</th><th>Device</th><th>Value</th><th>Lane</th></tr></thead>
+                <tbody>
+                    @foreach (var p in stats.RecentProcessed)
+                    {
+                        <tr><td>@p.Sequence</td><td>@p.DeviceName</td><td>@p.Value.ToString("F1")</td><td class="lane-@p.Lane">@p.Lane</td></tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Timestamped History <span class="muted-small">(SortedDictionary)</span></h2>
+        @if (Ui.SelectedMac is null)
+        {
+            <p class="muted-small">Click a device row to load its history.</p>
+        }
+        else
+        {
+            <p><strong>@(allDevices.FirstOrDefault(x => x.Mac == Ui.SelectedMac)?.Name ?? Ui.SelectedMac)</strong>
+               <span class="muted-small">&mdash; @history.Count points, oldest to newest</span></p>
+            @if (history.Count > 1)
+            {
+                var min = history.Min(h => h.Value);
+                var max = history.Max(h => h.Value);
+                var range = max - min < 0.0001 ? 1 : max - min;
+                var pts = string.Join(" ", history.Select((h, i) =>
+                    $"{(i * 300.0 / (history.Count - 1)).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)},{(70 - (h.Value - min) / range * 60).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}"));
+                <svg class="spark" width="100%" viewBox="0 0 300 80" preserveAspectRatio="none">
+                    <polyline points="@pts" fill="none" stroke="#4d7cff" stroke-width="2" />
+                </svg>
+            }
+            <div class="scroll-box" style="max-height:150px">
+                <table class="data-table small">
+                    <tbody>
+                        @foreach (var h in history.AsEnumerable().Reverse().Take(15))
+                        {
+                            <tr><td>@h.Timestamp.ToLocalTime().ToString("HH:mm:ss.fff")</td><td>@h.Value.ToString("F1")</td></tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    </section>
+</div>
+
+@code {
+    private StreamStatsDto stats = new();
+    private AlertsViewDto alerts = new();
+    private InsightsViewDto insights = new();
+    private List<DeviceViewDto> devices = new();
+    private List<DeviceViewDto> allDevices = new();
+    private List<CommandRecordDto> commands = new();
+    private List<HistoryPointDto> history = new();
+
+    private string testDevice = "";
+    private string toolMessage = "";
+    private string commandMessage = "";
+    private bool commandOk;
+    private System.Threading.Timer? timer;
+    private int polling;
+    private DateTime lastSearchLog = DateTime.MinValue;
+    private CancellationTokenSource? searchDebounce;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshAsync();
+        if (string.IsNullOrEmpty(testDevice))
+            testDevice = allDevices.FirstOrDefault(d => !d.IsActuator)?.Mac ?? "";
+
+        timer = new System.Threading.Timer(_ => { _ = TickAsync(); }, null,
+            TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    }
+
+    private async Task TickAsync()
+    {
+        if (Interlocked.Exchange(ref polling, 1) == 1) return;
+        try { await InvokeAsync(RefreshAsync); }
+        catch { /* circuit closed or API unavailable: try again next tick */ }
+        finally { Interlocked.Exchange(ref polling, 0); }
+    }
+
+    private async Task RefreshAsync()
+    {
+        try
+        {
+            stats = await Api.GetStreamStatsAsync();
+            alerts = await Api.GetAlertsAsync();
+            insights = await Api.GetInsightsAsync();
+            commands = await Api.GetCommandHistoryAsync();
+            allDevices = await Api.QueryDevicesAsync(null, null, null);
+            devices = await Api.QueryDevicesAsync(Ui.SearchText, Ui.CategoryFilter, Ui.StateFilter);
+            if (Ui.SelectedMac is not null)
+                history = await Api.GetHistoryAsync(Ui.SelectedMac);
+        }
+        catch (HttpRequestException)
+        {
+            toolMessage = "API unreachable - start SmartX.Api.";
+        }
+        StateHasChanged();
+    }
+
+    // ------------------------------------------------------------- filters (state kept in UiState)
+
+    private async Task OnSearchInput(ChangeEventArgs e)
+    {
+        Ui.SearchText = e.Value?.ToString() ?? "";
+        devices = await Api.QueryDevicesAsync(Ui.SearchText, Ui.CategoryFilter, Ui.StateFilter);
+
+        // Log the finished search term (debounced) so the predictive engine can learn from it.
+        searchDebounce?.Cancel();
+        searchDebounce = new CancellationTokenSource();
+        var token = searchDebounce.Token;
+        var text = Ui.SearchText;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(1200, token);
+                if (text.Trim().Length >= 3) await Api.LogSearchAsync(text.Trim());
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+        });
+    }
+
+    private async Task OnCategoryChanged(ChangeEventArgs e)
+    {
+        Ui.CategoryFilter = e.Value?.ToString() ?? "All";
+        devices = await Api.QueryDevicesAsync(Ui.SearchText, Ui.CategoryFilter, Ui.StateFilter);
+    }
+
+    private async Task OnStateChanged(ChangeEventArgs e)
+    {
+        Ui.StateFilter = e.Value?.ToString() ?? "All";
+        devices = await Api.QueryDevicesAsync(Ui.SearchText, Ui.CategoryFilter, Ui.StateFilter);
+    }
+
+    private async Task ApplySearch(string text)
+    {
+        Ui.SearchText = text;
+        devices = await Api.QueryDevicesAsync(Ui.SearchText, Ui.CategoryFilter, Ui.StateFilter);
+        await Api.LogSearchAsync(text);
+    }
+
+    private async Task SelectDevice(string mac)
+    {
+        Ui.SelectedMac = mac;
+        history = await Api.GetHistoryAsync(mac);
+    }
+
+    // ------------------------------------------------------------- commands
+
+    private async Task SendCommand()
+    {
+        var (ok, message) = await Api.IssueCommandAsync(Ui.CommandTarget, Ui.CommandAction);
+        commandOk = ok;
+        commandMessage = message;
+        await RefreshAsync();
+    }
+
+    private async Task Quick(string mac, string action)
+    {
+        var (ok, message) = await Api.IssueCommandAsync(mac, action);
+        commandOk = ok;
+        commandMessage = message;
+        await RefreshAsync();
+    }
+
+    private Task QuickToggle(DeviceViewDto d) => Quick(d.Mac, d.IsOn ? "Off" : "On");
+
+    private async Task Undo()
+    {
+        var (ok, message) = await Api.UndoLastCommandAsync();
+        commandOk = ok;
+        commandMessage = message;
+        await RefreshAsync();
+    }
+
+    // ------------------------------------------------------------- test tools
+
+    private DeviceViewDto? TestDevice => allDevices.FirstOrDefault(d => d.Mac == testDevice);
+
+    private async Task FireCritical()
+    {
+        var d = TestDevice;
+        if (d is null) { toolMessage = "Pick a sensor first."; return; }
+        toolMessage = await Sim.FireCriticalAsync(d);
+        await RefreshAsync();
+    }
+
+    private async Task SendBurst()
+    {
+        toolMessage = await Sim.SendBurstAsync(allDevices, 150);
+        await RefreshAsync();
+    }
+
+    private async Task ReportDisconnect3()
+    {
+        if (string.IsNullOrEmpty(testDevice)) { toolMessage = "Pick a sensor first."; return; }
+        DisconnectResultDto? last = null;
+        for (var i = 0; i < 3; i++)
+            last = await Api.ReportDisconnectAsync(testDevice);
+
+        toolMessage = last is null
+            ? "API rejected the disconnect report."
+            : $"Reported 3 times. Unique disconnect entries stay at one; duplicates suppressed so far: {last.DuplicatesSuppressedTotal}.";
+        await RefreshAsync();
+    }
+
+    private void MuteTest()
+    {
+        if (string.IsNullOrEmpty(testDevice)) { toolMessage = "Pick a sensor first."; return; }
+        Sim.ToggleMute(testDevice);
+        toolMessage = Sim.IsMuted(testDevice)
+            ? "Device muted: with the simulator running it will be flagged Disconnected after about 20 s."
+            : "Device unmuted: it will recover on its next packet.";
+    }
+
+    public void Dispose()
+    {
+        timer?.Dispose();
+        searchDebounce?.Cancel();
+    }
+}
