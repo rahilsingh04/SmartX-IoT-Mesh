@@ -1,0 +1,57 @@
+@page "/"
+@inject SmartXApiClient Api
+
+<PageTitle>Smart-X Gateway</PageTitle>
+
+<h1>Smart-X Gateway</h1>
+<p class="lead">Choose an architectural pillar to work with. Parts 1 and 2 implement the first two pillars;
+the third is reserved for the final PoE.</p>
+
+<div class="api-status @(apiOnline == true ? "online" : apiOnline == false ? "offline" : "")">
+    @if (apiOnline is null)
+    {
+        <span>Checking API connection&hellip;</span>
+    }
+    else if (apiOnline == true)
+    {
+        <span>&#9679; SmartX.Api ingestion gateway is online</span>
+    }
+    else
+    {
+        <span>&#9679; SmartX.Api is unreachable &mdash; start SmartX.Api before using the dashboard.</span>
+    }
+</div>
+
+<div class="pillar-grid">
+    <a class="pillar-card enabled" href="/ingestion">
+        <div class="pillar-icon">📡</div>
+        <h2>Sensor Data Ingestion &amp; Telemetry</h2>
+        <p>Register sensors, ingest live telemetry, attach device logs, and monitor mesh health on the
+        gamified live pulse grid.</p>
+        <span class="pillar-cta">Open &rarr;</span>
+    </a>
+
+    <a class="pillar-card enabled" href="/command-stream">
+        <div class="pillar-icon">⏱</div>
+        <h2>Real-Time Command Stream &amp; History</h2>
+        <p>Live device dictionary, FIFO + priority queues, manual overrides with Undo, timestamped
+        history and predictive suggested actions.</p>
+        <span class="pillar-cta">Open &rarr;</span>
+    </a>
+
+    <div class="pillar-card disabled">
+        <div class="pillar-icon">🕸</div>
+        <h2>Network Topology &amp; Mesh Routing</h2>
+        <p>Visual mesh topology and routing diagnostics.</p>
+        <span class="pillar-cta">Disabled &mdash; Final PoE</span>
+    </div>
+</div>
+
+@code {
+    private bool? apiOnline;
+
+    protected override async Task OnInitializedAsync()
+    {
+        apiOnline = await Api.IsApiOnlineAsync();
+    }
+}
