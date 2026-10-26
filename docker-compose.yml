@@ -1,0 +1,25 @@
+services:
+  smartx-api:
+    build:
+      context: .
+      dockerfile: SmartX.Api/Dockerfile
+    container_name: smartx-api
+    ports:
+      - "5080:5080"
+    volumes:
+      - smartx-uploads:/app/SecureUploads
+
+  smartx-client:
+    build:
+      context: .
+      dockerfile: SmartX.Client/Dockerfile
+    container_name: smartx-client
+    ports:
+      - "5090:5090"
+    environment:
+      - SmartXApi__PublicUrl=http://localhost:5080
+    depends_on:
+      - smartx-api
+
+volumes:
+  smartx-uploads:
