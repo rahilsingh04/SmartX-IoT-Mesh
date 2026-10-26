@@ -1,0 +1,38 @@
+@inherits LayoutComponentBase
+@inject SimulatorService Sim
+@implements IDisposable
+
+<div class="smartx-shell">
+    <header class="smartx-header">
+        <div class="brand">
+            <span class="brand-mark">◎</span>
+            <div>
+                <div class="brand-title">Smart-X</div>
+                <div class="brand-sub">IoT Mesh Ecosystem Gateway</div>
+            </div>
+        </div>
+        <nav class="smartx-nav">
+            <span class="sim-badge @(Sim.IsRunning ? "on" : "")">@(Sim.IsRunning ? "● Simulator running" : "○ Simulator stopped")</span>
+            <a href="/">Home</a>
+            <a href="/ingestion">Sensor Ingestion</a>
+            <a href="/command-stream">Command Stream</a>
+            <span class="nav-disabled" title="Final PoE">Network Topology</span>
+        </nav>
+    </header>
+
+    <main class="smartx-main">
+        @Body
+    </main>
+
+    <footer class="smartx-footer">
+        Smart-X Data Ingestion &amp; Validation Gateway &middot; Part 2 build
+    </footer>
+</div>
+
+@code {
+    protected override void OnInitialized() => Sim.Changed += OnSimChanged;
+
+    private void OnSimChanged() => _ = InvokeAsync(() => { try { StateHasChanged(); } catch (ObjectDisposedException) { } });
+
+    public void Dispose() => Sim.Changed -= OnSimChanged;
+}
